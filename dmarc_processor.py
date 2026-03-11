@@ -38,6 +38,7 @@ IMAP_PORT     = int(os.getenv('IMAP_PORT', '993'))
 IMAP_USER     = os.environ['IMAP_USER']
 IMAP_PASSWORD = os.environ['IMAP_PASSWORD']
 IMAP_FOLDER   = [f.strip() for f in os.getenv('IMAP_FOLDER', 'INBOX').split(',') if f.strip()]
+TRASH_FOLDER  = os.getenv('TRASH_FOLDER', 'Trash')
 DB_PATH       = Path(os.getenv('DB_PATH', 'dmarc_reports.db'))
 
 # Content-Types, die DMARC-Anhänge enthalten können
@@ -346,6 +347,22 @@ def process_message(msg, message_id: str, conn: sqlite3.Connection) -> int:
 # IMAP-Verarbeitung
 # ---------------------------------------------------------------------------
 
+def _move_to_trash(imap: imaplib.IMAP4_SSL, uid: bytes, trash_folder: str) -> bool:
+    """Verschiebt eine Mail per UID in den Papierkorb. Gibt True bei Erfolg zurück."""
+    # Versuche MOVE (RFC 6851) – atomar und effizient
+    typ, _ = imap.uid('MOVE', uid, trash_folder)
+    if typ == 'OK':
+        return True
+    # Fallback: COPY + als gelöscht markieren
+    typ, _ = imap.uid('COPY', uid, trash_folder)
+    if typ != 'OK':
+        log.warning("COPY nach '%s' fehlgeschlagen für UID %s", trash_folder, uid.decode())
+        return False
+    imap.uid('STORE', uid, '+FLAGS', '\\Deleted')
+    imap.expunge()
+    return True
+
+
 def _load_folder_state(conn: sqlite3.Connection, folder: str) -> tuple[int, int]:
     """Lädt (uidvalidity, last_uid) aus der DB. Gibt (0, 0) wenn noch kein Eintrag."""
     row = conn.execute(
@@ -363,12 +380,12 @@ def _save_folder_state(conn: sqlite3.Connection, folder: str, uidvalidity: int, 
     conn.commit()
 
 
-def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, conn: sqlite3.Connection) -> tuple[int, int]:
-    """Verarbeitet einen einzelnen IMAP-Ordner. Gibt (new_count, skip_count) zurück."""
+def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """Verarbeitet einen einzelnen IMAP-Ordner. Gibt (new_count, skip_count, trash_count) zurück."""
     typ, data = imap.select(folder, readonly=False)
     if typ != 'OK':
         log.warning("IMAP SELECT fehlgeschlagen für Ordner '%s': %s", folder, data)
-        return 0, 0
+        return 0, 0, 0
 
     # UIDVALIDITY per STATUS-Befehl holen (zuverlässig, kein Dummy-Search nötig)
     uidvalidity: int | None = None
@@ -399,20 +416,22 @@ def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, c
     typ, data = imap.uid('SEARCH', 'UID', search_range)
     if typ != 'OK':
         log.warning("IMAP UID SEARCH fehlgeschlagen für Ordner '%s': %s", folder, data)
-        return 0, 0
+        return 0, 0, 0
 
     uid_list = [uid for uid in data[0].split() if int(uid) > last_uid]
     log.info("%d neue Mails (UID > %d) im Ordner '%s'", len(uid_list), last_uid, folder)
 
     if not uid_list:
         _save_folder_state(conn, folder, uidvalidity, last_uid)
-        return 0, 0
+        return 0, 0, 0
 
     mail_ids = uid_list  # ab hier UIDs statt Sequence Numbers
 
-    new_count  = 0
-    skip_count = 0
-    max_uid    = last_uid
+    seen_in_batch: set[str] = set()
+    new_count   = 0
+    skip_count  = 0
+    trash_count = 0
+    max_uid     = last_uid
 
     for uid in mail_ids:
         uid_int = int(uid)
@@ -435,7 +454,15 @@ def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, c
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,))
         if cur.fetchone():
-            skip_count += 1
+            if message_id in seen_in_batch:
+                # Batch-Duplikat: identische Mail mehrfach zugestellt → in Papierkorb
+                if _move_to_trash(imap, uid, TRASH_FOLDER):
+                    trash_count += 1
+                    log.info("Batch-Duplikat in Papierkorb verschoben: %s (UID %s)", message_id, uid.decode())
+                else:
+                    skip_count += 1
+            else:
+                skip_count += 1
             max_uid = max(max_uid, uid_int)
             continue
 
@@ -458,6 +485,7 @@ def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, c
 
             if record_count > 0:
                 conn.commit()
+                seen_in_batch.add(message_id)
                 new_count += 1
                 if was_unread:
                     imap.uid('STORE', uid, '+FLAGS', '\\Seen')
@@ -474,7 +502,7 @@ def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, c
         max_uid = max(max_uid, uid_int)
 
     _save_folder_state(conn, folder, uidvalidity, max_uid)
-    return new_count, skip_count
+    return new_count, skip_count, trash_count
 
 
 def process_mailbox(conn: sqlite3.Connection) -> None:
@@ -487,17 +515,19 @@ def process_mailbox(conn: sqlite3.Connection) -> None:
     with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
         imap.login(IMAP_USER, IMAP_PASSWORD)
 
-        total_new  = 0
-        total_skip = 0
+        total_new   = 0
+        total_skip  = 0
+        total_trash = 0
 
         for folder in IMAP_FOLDER:
-            new, skip = _process_folder(imap, folder, parser, conn)
-            total_new  += new
-            total_skip += skip
+            new, skip, trash = _process_folder(imap, folder, parser, conn)
+            total_new   += new
+            total_skip  += skip
+            total_trash += trash
 
         log.info(
-            "Fertig: %d neue Reports verarbeitet, %d bereits bekannte übersprungen.",
-            total_new, total_skip,
+            "Fertig: %d neue Reports verarbeitet, %d bereits bekannte übersprungen, %d Batch-Duplikate in Papierkorb.",
+            total_new, total_skip, total_trash,
         )
 
 

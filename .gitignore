@@ -1,0 +1,24 @@
+# Credentials
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# SQLite-Datenbank (enthält echte Mail-Daten)
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# Workspace-interne Dateien
+copilot-instructions.md
+description.txt

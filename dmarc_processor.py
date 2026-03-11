@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """DMARC Report Processor – liest DMARC-Reports aus IMAP und speichert sie in SQLite."""
 
+import argparse
 import gzip
 import imaplib
 import io
@@ -21,13 +22,22 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='DMARC Report Processor')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='Nur Warnungen und Fehler ausgeben (für Cronjob)')
+    parser.add_argument('--rescan', action='store_true',
+                        help='Alle Ordner neu scannen (setzt last_uid zurück)')
+    return parser.parse_args()
+
 load_dotenv()
 
 IMAP_HOST     = os.environ['IMAP_HOST']
 IMAP_PORT     = int(os.getenv('IMAP_PORT', '993'))
 IMAP_USER     = os.environ['IMAP_USER']
 IMAP_PASSWORD = os.environ['IMAP_PASSWORD']
-IMAP_FOLDER   = os.getenv('IMAP_FOLDER', 'INBOX')
+IMAP_FOLDER   = [f.strip() for f in os.getenv('IMAP_FOLDER', 'INBOX').split(',') if f.strip()]
 DB_PATH       = Path(os.getenv('DB_PATH', 'dmarc_reports.db'))
 
 # Content-Types, die DMARC-Anhänge enthalten können
@@ -105,6 +115,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             domain    TEXT,
             scope     TEXT,
             result    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS folder_state (
+            folder      TEXT PRIMARY KEY,
+            uidvalidity INTEGER NOT NULL,
+            last_uid    INTEGER NOT NULL DEFAULT 0
         );
     """)
     conn.commit()
@@ -330,95 +346,158 @@ def process_message(msg, message_id: str, conn: sqlite3.Connection) -> int:
 # IMAP-Verarbeitung
 # ---------------------------------------------------------------------------
 
+def _load_folder_state(conn: sqlite3.Connection, folder: str) -> tuple[int, int]:
+    """Lädt (uidvalidity, last_uid) aus der DB. Gibt (0, 0) wenn noch kein Eintrag."""
+    row = conn.execute(
+        "SELECT uidvalidity, last_uid FROM folder_state WHERE folder = ?", (folder,)
+    ).fetchone()
+    return (row[0], row[1]) if row else (0, 0)
+
+
+def _save_folder_state(conn: sqlite3.Connection, folder: str, uidvalidity: int, last_uid: int) -> None:
+    conn.execute(
+        "INSERT INTO folder_state (folder, uidvalidity, last_uid) VALUES (?, ?, ?)"
+        " ON CONFLICT(folder) DO UPDATE SET uidvalidity = excluded.uidvalidity, last_uid = excluded.last_uid",
+        (folder, uidvalidity, last_uid),
+    )
+    conn.commit()
+
+
+def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, conn: sqlite3.Connection) -> tuple[int, int]:
+    """Verarbeitet einen einzelnen IMAP-Ordner. Gibt (new_count, skip_count) zurück."""
+    typ, data = imap.select(folder, readonly=False)
+    if typ != 'OK':
+        log.warning("IMAP SELECT fehlgeschlagen für Ordner '%s': %s", folder, data)
+        return 0, 0
+
+    # UIDVALIDITY per STATUS-Befehl holen (zuverlässig, kein Dummy-Search nötig)
+    uidvalidity: int | None = None
+    typ3, status_data = imap.status(folder, '(UIDVALIDITY)')
+    if typ3 == 'OK' and status_data:
+        raw = status_data[0]
+        if isinstance(raw, bytes) and b'UIDVALIDITY' in raw:
+            try:
+                uidvalidity = int(raw.split(b'UIDVALIDITY')[1].strip().rstrip(b')'))
+            except (ValueError, IndexError):
+                pass
+
+    if uidvalidity is None:
+        log.warning("Konnte UIDVALIDITY für '%s' nicht ermitteln – Full-Scan", folder)
+        uidvalidity = 0
+
+    saved_uidvalidity, last_uid = _load_folder_state(conn, folder)
+
+    if saved_uidvalidity != uidvalidity:
+        if saved_uidvalidity != 0:
+            log.warning(
+                "UIDVALIDITY für '%s' hat sich geändert (%d → %d) – Full-Rescan",
+                folder, saved_uidvalidity, uidvalidity,
+            )
+        last_uid = 0
+
+    search_range = f'{last_uid + 1}:*'
+    typ, data = imap.uid('SEARCH', 'UID', search_range)
+    if typ != 'OK':
+        log.warning("IMAP UID SEARCH fehlgeschlagen für Ordner '%s': %s", folder, data)
+        return 0, 0
+
+    uid_list = [uid for uid in data[0].split() if int(uid) > last_uid]
+    log.info("%d neue Mails (UID > %d) im Ordner '%s'", len(uid_list), last_uid, folder)
+
+    if not uid_list:
+        _save_folder_state(conn, folder, uidvalidity, last_uid)
+        return 0, 0
+
+    mail_ids = uid_list  # ab hier UIDs statt Sequence Numbers
+
+    new_count  = 0
+    skip_count = 0
+    max_uid    = last_uid
+
+    for uid in mail_ids:
+        uid_int = int(uid)
+
+        # Message-ID + FLAGS in einem PEEK-Fetch holen
+        typ, fetch_data = imap.uid('FETCH', uid, '(FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+        if typ != 'OK' or not fetch_data or fetch_data[0] is None:
+            continue
+
+        raw_header = fetch_data[0][1]
+        header_msg = parser.parsebytes(raw_header)
+        message_id = header_msg.get('message-id', '').strip()
+
+        if not message_id:
+            log.debug("UID %s ohne Message-ID – übersprungen", uid.decode())
+            max_uid = max(max_uid, uid_int)
+            continue
+
+        # Message-ID als Sicherheitsnetz gegen UID-Kollisionen nach UIDVALIDITY-Reset
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,))
+        if cur.fetchone():
+            skip_count += 1
+            max_uid = max(max_uid, uid_int)
+            continue
+
+        was_unread = b'\\Seen' not in fetch_data[0][0]
+
+        typ, full_data = imap.uid('FETCH', uid, '(BODY.PEEK[])')
+        if typ != 'OK' or not full_data or full_data[0] is None:
+            log.warning("UID %s konnte nicht geladen werden", uid.decode())
+            continue
+
+        raw_mail = full_data[0][1]
+        msg = parser.parsebytes(raw_mail)
+
+        try:
+            conn.execute(
+                "INSERT INTO processed_messages (message_id) VALUES (?)",
+                (message_id,),
+            )
+            record_count = process_message(msg, message_id, conn)
+
+            if record_count > 0:
+                conn.commit()
+                new_count += 1
+                if was_unread:
+                    imap.uid('STORE', uid, '+FLAGS', '\\Seen')
+                    log.debug("Als gelesen markiert: %s", message_id)
+                log.info("Verarbeitet: %s – %d Records eingefügt", message_id, record_count)
+            else:
+                conn.rollback()
+                log.debug("Keine DMARC-Daten in UID %s", uid.decode())
+
+        except sqlite3.Error as exc:
+            conn.rollback()
+            log.error("Datenbankfehler bei %s: %s", message_id, exc)
+
+        max_uid = max(max_uid, uid_int)
+
+    _save_folder_state(conn, folder, uidvalidity, max_uid)
+    return new_count, skip_count
+
+
 def process_mailbox(conn: sqlite3.Connection) -> None:
     log.info(
         "Verbinde mit %s:%d (Ordner: %s, User: %s)",
-        IMAP_HOST, IMAP_PORT, IMAP_FOLDER, IMAP_USER,
+        IMAP_HOST, IMAP_PORT, ', '.join(IMAP_FOLDER), IMAP_USER,
     )
     parser = BytesParser(policy=email_policy.default)
 
     with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
         imap.login(IMAP_USER, IMAP_PASSWORD)
 
-        typ, data = imap.select(IMAP_FOLDER, readonly=False)
-        if typ != 'OK':
-            raise RuntimeError(f"IMAP SELECT fehlgeschlagen: {data}")
+        total_new  = 0
+        total_skip = 0
 
-        typ, data = imap.search(None, 'ALL')
-        if typ != 'OK':
-            raise RuntimeError(f"IMAP SEARCH fehlgeschlagen: {data}")
-
-        mail_ids = data[0].split()
-        log.info("%d Mails im Ordner '%s'", len(mail_ids), IMAP_FOLDER)
-
-        new_count  = 0
-        skip_count = 0
-
-        for mail_id in mail_ids:
-            # Nur Message-ID aus Header laden (PEEK → kein \Seen-Setzen)
-            typ, header_data = imap.fetch(mail_id, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
-            if typ != 'OK' or not header_data or header_data[0] is None:
-                continue
-
-            raw_header = header_data[0][1]
-            header_msg = parser.parsebytes(raw_header)
-            message_id = header_msg.get('message-id', '').strip()
-
-            if not message_id:
-                log.debug("Mail %s ohne Message-ID – übersprungen", mail_id.decode())
-                continue
-
-            # Bereits in der DB?
-            cur = conn.cursor()
-            cur.execute("SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,))
-            if cur.fetchone():
-                skip_count += 1
-                continue
-
-            # War die Mail ungelesen? (vor dem Abrufen prüfen)
-            typ, flags_data = imap.fetch(mail_id, '(FLAGS)')
-            was_unread = (
-                typ == 'OK'
-                and bool(flags_data)
-                and flags_data[0] is not None
-                and b'\\Seen' not in flags_data[0]
-            )
-
-            # Vollständige Mail laden (PEEK → kein automatisches \Seen-Setzen)
-            typ, full_data = imap.fetch(mail_id, '(BODY.PEEK[])')
-            if typ != 'OK' or not full_data or full_data[0] is None:
-                log.warning("Mail %s konnte nicht geladen werden", mail_id.decode())
-                continue
-
-            raw_mail = full_data[0][1]
-            msg = parser.parsebytes(raw_mail)
-
-            # Transaktion: processed_messages + alle Report-Daten atomar committen
-            try:
-                conn.execute(
-                    "INSERT INTO processed_messages (message_id) VALUES (?)",
-                    (message_id,),
-                )
-                record_count = process_message(msg, message_id, conn)
-
-                if record_count > 0:
-                    conn.commit()
-                    new_count += 1
-                    if was_unread:
-                        imap.store(mail_id, '+FLAGS', '\\Seen')
-                        log.debug("Als gelesen markiert: %s", message_id)
-                    log.info("Verarbeitet: %s – %d Records eingefügt", message_id, record_count)
-                else:
-                    conn.rollback()
-                    log.debug("Keine DMARC-Daten in Mail %s", message_id)
-
-            except sqlite3.Error as exc:
-                conn.rollback()
-                log.error("Datenbankfehler bei %s: %s", message_id, exc)
+        for folder in IMAP_FOLDER:
+            new, skip = _process_folder(imap, folder, parser, conn)
+            total_new  += new
+            total_skip += skip
 
         log.info(
             "Fertig: %d neue Reports verarbeitet, %d bereits bekannte übersprungen.",
-            new_count, skip_count,
+            total_new, total_skip,
         )
 
 
@@ -427,10 +506,18 @@ def process_mailbox(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    args = _parse_args()
+    if args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         init_db(conn)
+        if args.rescan:
+            conn.execute("UPDATE folder_state SET last_uid = 0")
+            conn.commit()
+            log.info("Rescan: last_uid für alle Ordner zurückgesetzt.")
         process_mailbox(conn)
     except KeyboardInterrupt:
         log.info("Abgebrochen.")

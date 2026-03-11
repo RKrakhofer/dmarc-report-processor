@@ -17,6 +17,18 @@ SEP  = '-' * 80
 SEP2 = '=' * 80
 
 
+def _glob_to_sql_like(pattern: str) -> str:
+    """Konvertiert ein Shell-Glob-Muster in ein SQLite-LIKE-Muster (ESCAPE '\\')."""
+    result = ''
+    for ch in pattern:
+        if ch == '%':  result += r'\%'
+        elif ch == '_': result += r'\_'
+        elif ch == '*': result += '%'
+        elif ch == '?': result += '_'
+        else:           result += ch
+    return result
+
+
 def fmt_row(row: sqlite3.Row, *cols: str) -> str:
     return '  '.join(f"{c}={row[c]}" for c in cols if row[c] is not None)
 
@@ -423,10 +435,64 @@ def _print_envelope_to_detail(conn: sqlite3.Connection, domain: str) -> None:
         print(f"  {'-' * 60}")
 
 
+def _print_envelope_domain_list(conn: sqlite3.Connection, pattern: str) -> None:
+    """Listet envelope_to-Domains und Mailanzahl, gefiltert per Glob-Muster."""
+    like = _glob_to_sql_like(pattern)
+    section(f"ENVELOPE-TO DOMAINS – Muster: {pattern}")
+    rows = conn.execute("""
+        SELECT
+            rr.envelope_to                                                          AS envelope_to,
+            SUM(rr.count)                                                           AS total,
+            SUM(CASE WHEN rr.dkim_eval = 'pass' THEN rr.count ELSE 0 END)          AS dkim_pass,
+            SUM(CASE WHEN rr.spf_eval  = 'pass' THEN rr.count ELSE 0 END)          AS spf_pass,
+            SUM(CASE WHEN rr.disposition IN ('reject','quarantine')
+                     THEN rr.count ELSE 0 END)                                      AS blocked,
+            COUNT(DISTINCT rr.source_ip)                                            AS ips
+        FROM report_records rr
+        WHERE rr.envelope_to LIKE ? ESCAPE '\\'
+        GROUP BY rr.envelope_to
+        ORDER BY total DESC
+    """, (like,)).fetchall()
+
+    if not rows:
+        print(f"  Keine Einträge mit envelope_to passend zu '{pattern}' gefunden.")
+        return
+
+    # org_names je envelope_to vorausladen (DISTINCT, sortiert)
+    org_map: dict[str, list[str]] = {}
+    for row in rows:
+        env = row['envelope_to']
+        orgs = conn.execute("""
+            SELECT DISTINCT r.org_name
+            FROM report_records rr
+            JOIN reports r ON r.id = rr.report_db_id
+            WHERE rr.envelope_to IS ?
+            ORDER BY r.org_name
+        """, (env,)).fetchall()
+        org_map[env] = [o['org_name'] for o in orgs if o['org_name']]
+
+    print(f"  {'envelope_to':<40} {'Total':>6}  {'DKIM✓':>6}  {'SPF✓':>6}  {'Blockiert':>9}  {'IPs':>4}  Orgs")
+    print(f"  {SEP}")
+    for row in rows:
+        blocked_marker = '  ⚠' if row['blocked'] > 0 else ''
+        env = row['envelope_to']
+        orgs_str = ', '.join(org_map.get(env) or [])
+        print(
+            f"  {(env or '(leer)'):<40} "
+            f"{row['total']:>6}  {row['dkim_pass']:>6}  {row['spf_pass']:>6}  "
+            f"{row['blocked']:>9}  {row['ips']:>4}  {orgs_str}{blocked_marker}"
+        )
+    total_all = sum(r['total'] for r in rows)
+    print(f"  {SEP}")
+    print(f"  {'GESAMT (' + str(len(rows)) + ' Domains)':<40} {total_all:>6}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='DMARC Report')
     parser.add_argument('--envelope-to', metavar='DOMAIN',
-                        help='Zeige alle Details für Einträge mit dieser envelope_to-Domain')
+                        help='Zeige alle Details f\u00fcr Eintr\u00e4ge mit dieser envelope_to-Domain')
+    parser.add_argument('-l', '--list', metavar='GLOB',
+                        help='Liste envelope_to-Domains + Mailanzahl; Glob-Wildcards * und ? erlaubt (z.B. "*.google.com")')
     args = parser.parse_args()
 
     if not DB_PATH.exists():
@@ -435,7 +501,9 @@ def main() -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
-        if args.envelope_to:
+        if args.list:
+            _print_envelope_domain_list(conn, args.list)
+        elif args.envelope_to:
             _print_envelope_to_detail(conn, args.envelope_to)
         else:
             run(conn)

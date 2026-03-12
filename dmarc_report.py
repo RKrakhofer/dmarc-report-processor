@@ -487,12 +487,80 @@ def _print_envelope_domain_list(conn: sqlite3.Connection, pattern: str) -> None:
     print(f"  {'GESAMT (' + str(len(rows)) + ' Domains)':<40} {total_all:>6}")
 
 
+def _print_arc_overrides(conn: sqlite3.Connection) -> None:
+    """Listet alle Records, bei denen ein Provider die DMARC-Policy überschrieben hat."""
+    section("ARC / PROVIDER-OVERRIDES – reason_type gesetzt")
+    rows = conn.execute("""
+        SELECT
+            datetime(r.date_begin, 'unixepoch')  AS von,
+            datetime(r.date_end,   'unixepoch')  AS bis,
+            r.org_name,
+            r.domain                             AS policy_domain,
+            r.policy_p,
+            rr.source_ip,
+            rr.count,
+            rr.disposition,
+            rr.dkim_eval,
+            rr.spf_eval,
+            rr.reason_type,
+            rr.reason_comment,
+            rr.header_from,
+            rr.envelope_from,
+            rr.id                                AS record_id
+        FROM report_records rr
+        JOIN reports r ON r.id = rr.report_db_id
+        WHERE rr.reason_type IS NOT NULL
+        ORDER BY r.date_end DESC, rr.count DESC
+    """).fetchall()
+
+    if not rows:
+        print("  Keine Provider-Overrides in der Datenbank. ✓")
+        return
+
+    print(f"  {'Zeitraum':<22}  {'Org':<25}  {'Domain':<20}  {'IP':<18}  "
+          f"{'cnt':>4}  {'DKIM':>5}  {'SPF':>5}  {'disp':<12}  Reason")
+    print(f"  {SEP}")
+    for row in rows:
+        dkim_mark = '✓' if row['dkim_eval'] == 'pass' else '✗'
+        spf_mark  = '✓' if row['spf_eval']  == 'pass' else '✗'
+        reason = row['reason_type']
+        if row['reason_comment']:
+            reason += f" ({row['reason_comment']})"
+        print(
+            f"  {row['bis']:<22}  {(row['org_name'] or ''):<25}  "
+            f"{row['policy_domain']:<20}  {(row['source_ip'] or ''):<18}  "
+            f"{row['count']:>4}  DKIM{dkim_mark}  SPF{spf_mark}  "
+            f"{row['disposition']:<12}  {reason}"
+        )
+        if row['header_from'] or row['envelope_from']:
+            from_parts = []
+            if row['header_from']:   from_parts.append(f"header_from={row['header_from']}")
+            if row['envelope_from']: from_parts.append(f"envelope_from={row['envelope_from']}")
+            print(f"    ↳ {' | '.join(from_parts)}")
+
+    # Zusammenfassung nach reason_type
+    print(f"\n  {SEP}")
+    print("  Zusammenfassung nach Override-Typ:")
+    summary = conn.execute("""
+        SELECT rr.reason_type, COUNT(*) AS records, SUM(rr.count) AS mails
+        FROM report_records rr
+        WHERE rr.reason_type IS NOT NULL
+        GROUP BY rr.reason_type
+        ORDER BY mails DESC
+    """).fetchall()
+    for s in summary:
+        print(f"    {s['reason_type']:<20}  {s['records']:>3} Records  {s['mails']:>6} Mails")
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='DMARC Report')
     parser.add_argument('--envelope-to', metavar='DOMAIN',
-                        help='Zeige alle Details f\u00fcr Eintr\u00e4ge mit dieser envelope_to-Domain')
+                        help='Zeige alle Details für Einträge mit dieser envelope_to-Domain')
     parser.add_argument('-l', '--list', metavar='GLOB',
                         help='Liste envelope_to-Domains + Mailanzahl; Glob-Wildcards * und ? erlaubt (z.B. "*.google.com")')
+    parser.add_argument('--arc', action='store_true',
+                        help='Zeige alle Records, bei denen ein Provider die DMARC-Policy überschrieben hat (reason_type gesetzt)')
     args = parser.parse_args()
 
     if not DB_PATH.exists():
@@ -501,7 +569,9 @@ def main() -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
-        if args.list:
+        if args.arc:
+            _print_arc_overrides(conn)
+        elif args.list:
             _print_envelope_domain_list(conn, args.list)
         elif args.envelope_to:
             _print_envelope_to_detail(conn, args.envelope_to)

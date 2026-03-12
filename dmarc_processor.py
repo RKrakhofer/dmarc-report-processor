@@ -11,6 +11,8 @@ import sqlite3
 import zipfile
 from pathlib import Path
 
+import re
+
 import defusedxml.ElementTree as ET
 from dotenv import load_dotenv
 from email import policy as email_policy
@@ -154,12 +156,22 @@ def _int(element, path: str, default: int | None = None) -> int | None:
 # DMARC-XML-Parser
 # ---------------------------------------------------------------------------
 
+def _strip_xml_namespaces(xml_bytes: bytes) -> bytes:
+    """Entfernt XML-Namespace-Deklarationen und -Präfixe damit ElementTree ohne ns-Handling arbeitet."""
+    # xmlns="..." und xmlns:prefix="..." entfernen
+    xml_bytes = re.sub(rb'\s+xmlns(?::\w+)?="[^"]*"', b'', xml_bytes)
+    # Namespace-Präfixe von Tags entfernen: <ns:tag> / </ns:tag>
+    xml_bytes = re.sub(rb'<(/?)(\w+:)', rb'<\1', xml_bytes)
+    return xml_bytes
+
+
 def parse_dmarc_xml(xml_bytes: bytes, message_id: str, conn: sqlite3.Connection) -> int:
     """
     Parst einen DMARC-Report (XML-Bytes) und schreibt alle Felder in die DB.
     Der Aufrufer ist für das Commit/Rollback verantwortlich.
     Gibt die Anzahl der eingefügten Records zurück.
     """
+    xml_bytes = _strip_xml_namespaces(xml_bytes)
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:
@@ -454,13 +466,10 @@ def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, c
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM processed_messages WHERE message_id = ?", (message_id,))
         if cur.fetchone():
-            if message_id in seen_in_batch:
-                # Batch-Duplikat: identische Mail mehrfach zugestellt → in Papierkorb
-                if _move_to_trash(imap, uid, TRASH_FOLDER):
-                    trash_count += 1
-                    log.info("Batch-Duplikat in Papierkorb verschoben: %s (UID %s)", message_id, uid.decode())
-                else:
-                    skip_count += 1
+            # Bereits in DB bekannt → immer in Papierkorb schieben
+            if _move_to_trash(imap, uid, TRASH_FOLDER):
+                trash_count += 1
+                log.info("Bereits bekannte Mail in Papierkorb verschoben: %s (UID %s)", message_id, uid.decode())
             else:
                 skip_count += 1
             max_uid = max(max_uid, uid_int)
@@ -526,8 +535,8 @@ def process_mailbox(conn: sqlite3.Connection) -> None:
             total_trash += trash
 
         log.info(
-            "Fertig: %d neue Reports verarbeitet, %d bereits bekannte übersprungen, %d Batch-Duplikate in Papierkorb.",
-            total_new, total_skip, total_trash,
+            "Fertig: %d neue Reports verarbeitet, %d bereits bekannte in Papierkorb, %d Moves fehlgeschlagen.",
+            total_new, total_trash, total_skip,
         )
 
 

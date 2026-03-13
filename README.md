@@ -9,7 +9,8 @@ Python-Scripts, die DMARC-Reports aus einem IMAP-Postfach lesen, in einer SQLite
 - Finde Mails, die DMARC-Reports enthalten, und ermittle deren `Message-ID`
 - Ist die `Message-ID` noch nicht in der SQLite-DB → extrahiere und parse den DMARC-Report in die DB
 - Alle Felder des Reports speichern (Metadaten, Policy, Records, DKIM- und SPF-Auth-Ergebnisse)
-- War die Mail vor der Verarbeitung ungelesen → danach als gelesen markieren (`\Seen`)
+- Erfolgreich verarbeitete Mails → in den Papierkorb verschieben (IMAP MOVE, Fallback: COPY + \Deleted + ’\Seen’)
+- Bereits bekannte Mails (doppelter Import) → ebenfalls in den Papierkorb verschieben
 - Laufmodus: Cronjob (einmaliger Lauf, kein Daemon)
 - Inkrementelles Scanning via IMAP-UIDs – nur neue Mails werden geprüft (mit UIDVALIDITY-Sicherung)
 
@@ -53,6 +54,9 @@ MY_DOMAIN=domain.com
 # Kommagetrennte Ordnerliste (Standard: INBOX)
 IMAP_FOLDER=INBOX,DMARC
 
+# Papierkorb-Ordner für verarbeitete Mails (Standard: Trash)
+TRASH_FOLDER=Trash
+
 # Pfad zur SQLite-DB (Standard: dmarc_reports.db)
 DB_PATH=dmarc_reports.db
 ```
@@ -78,7 +82,11 @@ python dmarc_report.py      # Auswertung anzeigen
 ## dmarc_report.py – Optionen
 
 ```
---envelope-to DOMAIN    Zeige alle Details für Einträge mit dieser envelope_to-Domain
+--envelope-to DOMAIN      Alle Details für Einträge mit dieser envelope_to-Domain
+-l, --list GLOB           Listet envelope_to-Domains mit Mailanzahl; Wildcards * und ? erlaubt
+--arc                     Zeigt Records, bei denen ein Provider die DMARC-Policy überschrieben hat
+--timeline <N>[dwmy]      Reputation-Zeitverlauf (d=Tage, w=Wochen, m=Monate, y=Jahre)
+                          Beispiele: 30d, 4w, 12m, 2y
 ```
 
 Ohne Option: vollständiger Report mit 7 Sektionen:
@@ -89,6 +97,21 @@ Ohne Option: vollständiger Report mit 7 Sektionen:
 5. Eigene Domain im From mit Auth-Fehler
 6. Zeitraum der Reports
 7. Bewertung (inkl. DNS-Check auf Spoofing-Subdomains)
+
+### Timeline-Ausgabe
+
+Visualisiert die DKIM-Pass-Rate (= Domain-Reputation) als ASCII-Balkendiagramm, aggregiert nach Zeiteinheit:
+
+```
+════ REPUTATION-TIMELINE – example.com – letzte 30 Tage ════
+  Score = DKIM-Pass-Rate  |  ░ = 0%   █ = 100%  |  ⚠ Spoofing  ✗ Blockiert
+
+  Zeitraum        Total  DKIM✓  SPF✓  Spoof   Blk   Score  Verlauf
+  2026-02-12        234    234    220      0     0  100.0%  ██████████████████████████████
+  2026-02-20        189    185    180      2     0   97.9%  █████████████████████████████░ ⚠
+
+  Trend: ↑  Verbessert  (+0.9%)
+```
 
 ## Cronjob (täglich 6 Uhr)
 

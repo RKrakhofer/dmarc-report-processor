@@ -496,10 +496,15 @@ def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, c
                 conn.commit()
                 seen_in_batch.add(message_id)
                 new_count += 1
-                if was_unread:
-                    imap.uid('STORE', uid, '+FLAGS', '\\Seen')
-                    log.debug("Als gelesen markiert: %s", message_id)
                 log.info("Verarbeitet: %s – %d Records eingefügt", message_id, record_count)
+                if _move_to_trash(imap, uid, TRASH_FOLDER):
+                    trash_count += 1
+                    log.info("In Papierkorb verschoben: %s (UID %s)", message_id, uid.decode())
+                else:
+                    # Fallback: wenigstens als gelesen markieren
+                    if was_unread:
+                        imap.uid('STORE', uid, '+FLAGS', '\\Seen')
+                        log.debug("Als gelesen markiert: %s", message_id)
             else:
                 conn.rollback()
                 log.debug("Keine DMARC-Daten in UID %s", uid.decode())

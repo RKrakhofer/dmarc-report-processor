@@ -3,8 +3,10 @@
 
 import argparse
 import os
+import re
 import socket
 import sqlite3
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -487,6 +489,98 @@ def _print_envelope_domain_list(conn: sqlite3.Connection, pattern: str) -> None:
     print(f"  {'GESAMT (' + str(len(rows)) + ' Domains)':<40} {total_all:>6}")
 
 
+def _timeline_type(value: str) -> tuple[int, str]:
+    """Argparse-Type-Funktion: parst '<Zahl>[d|w|m|y]' in (count, unit)."""
+    m = re.fullmatch(r'(\d+)([dwmy])', value.lower())
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"Ungültiges Format '{value}'. Erwartet: <Zahl>[d|w|m|y]  z.B.: 30d, 4w, 12m, 2y"
+        )
+    return int(m.group(1)), m.group(2)
+
+
+def _print_timeline(conn: sqlite3.Connection, count: int, unit: str) -> None:
+    """Zeigt die Domain-Reputation als ASCII-Zeitverlauf."""
+    UNIT_SECS = {'d': 86_400, 'w': 7 * 86_400, 'm': 30 * 86_400, 'y': 365 * 86_400}
+    UNIT_NAME = {'d': 'Tage', 'w': 'Wochen', 'm': 'Monate', 'y': 'Jahre'}
+    SQL_FMT   = {'d': '%Y-%m-%d', 'w': '%Y-W%W', 'm': '%Y-%m', 'y': '%Y'}
+    BAR_WIDTH = 30
+
+    cutoff = int(time.time()) - count * UNIT_SECS[unit]
+    domain_label = f' – {MY_DOMAIN}' if MY_DOMAIN else ''
+    section(f"REPUTATION-TIMELINE{domain_label} – letzte {count} {UNIT_NAME[unit]}")
+    print(f"  Score = DKIM-Pass-Rate  |  ░ = 0 %   █ = 100 %  |  ⚠ Spoofing  ✗ Blockiert\n")
+
+    rows = conn.execute("""
+        SELECT
+            strftime(?, r.date_end, 'unixepoch')                                            AS bucket,
+            SUM(rr.count)                                                                    AS total,
+            SUM(CASE WHEN rr.dkim_eval = 'pass' THEN rr.count ELSE 0 END)                   AS dkim_pass,
+            SUM(CASE WHEN rr.spf_eval  = 'pass' THEN rr.count ELSE 0 END)                   AS spf_pass,
+            SUM(CASE WHEN rr.dkim_eval != 'pass' AND rr.spf_eval != 'pass'
+                     THEN rr.count ELSE 0 END)                                               AS spoof,
+            SUM(CASE WHEN rr.disposition IN ('reject','quarantine')
+                     THEN rr.count ELSE 0 END)                                               AS blocked
+        FROM report_records rr
+        JOIN reports r ON r.id = rr.report_db_id
+        WHERE r.date_end >= ?
+        GROUP BY bucket
+        ORDER BY bucket ASC
+    """, (SQL_FMT[unit], cutoff)).fetchall()
+
+    if not rows:
+        print("  Keine Daten im gewählten Zeitraum.")
+        return
+
+    print(f"  {'Zeitraum':<14}  {'Total':>6}  {'DKIM✓':>6}  {'SPF✓':>6}  {'Spoof':>5}  {'Blk':>4}  {'Score':>6}  Verlauf")
+    print(f"  {SEP}")
+
+    scores: list[float] = []
+    for row in rows:
+        total = row['total'] or 0
+        dkim  = row['dkim_pass'] or 0
+        spf   = row['spf_pass'] or 0
+        spoof = row['spoof'] or 0
+        blk   = row['blocked'] or 0
+
+        if total > 0:
+            score = dkim / total * 100
+            scores.append(score)
+            filled    = round(score / 100 * BAR_WIDTH)
+            bar       = '█' * filled + '░' * (BAR_WIDTH - filled)
+            score_str = f"{score:5.1f}%"
+            warn = ('⚠' if spoof > 0 else '') + ('✗' if blk > 0 else '')
+        else:
+            bar       = '·' * BAR_WIDTH
+            score_str = '     -'
+            warn      = ''
+
+        print(
+            f"  {(row['bucket'] or '?'):<14}  {total:>6}  {dkim:>6}  {spf:>6}  "
+            f"{spoof:>5}  {blk:>4}  {score_str}  {bar} {warn}"
+        )
+
+    # Trend
+    data = [(r['total'] or 0, r['dkim_pass'] or 0) for r in rows if (r['total'] or 0) > 0]
+    print(f"\n  {SEP}")
+    if len(data) >= 2:
+        s_first = data[0][1] / data[0][0] * 100
+        s_last  = data[-1][1] / data[-1][0] * 100
+        delta   = s_last - s_first
+        if abs(delta) < 1.0:
+            trend = '→  Stabil'
+        elif delta > 0:
+            trend = f'↑  Verbessert  (+{delta:.1f}%)'
+        else:
+            trend = f'↓  Verschlechtert  ({delta:.1f}%)'
+        print(f"  Trend: {trend}  (Anfang: {s_first:.1f}%  →  Ende: {s_last:.1f}%)")
+    elif scores:
+        print(f"  Nur eine Periode mit Daten – kein Trend berechenbar.")
+    else:
+        print("  Keine Mails im Zeitraum – kein Trend berechenbar.")
+    print()
+
+
 def _print_arc_overrides(conn: sqlite3.Connection) -> None:
     """Listet alle Records, bei denen ein Provider die DMARC-Policy überschrieben hat."""
     section("ARC / PROVIDER-OVERRIDES – reason_type gesetzt")
@@ -561,6 +655,8 @@ def main() -> None:
                         help='Liste envelope_to-Domains + Mailanzahl; Glob-Wildcards * und ? erlaubt (z.B. "*.google.com")')
     parser.add_argument('--arc', action='store_true',
                         help='Zeige alle Records, bei denen ein Provider die DMARC-Policy überschrieben hat (reason_type gesetzt)')
+    parser.add_argument('--timeline', metavar='<N>[dwmy]', type=_timeline_type,
+                        help='Reputation-Zeitverlauf: Anzahl + Einheit (d=Tage, w=Wochen, m=Monate, y=Jahre), z.B. 30d, 4w, 12m, 2y')
     args = parser.parse_args()
 
     if not DB_PATH.exists():
@@ -569,7 +665,9 @@ def main() -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
-        if args.arc:
+        if args.timeline:
+            _print_timeline(conn, *args.timeline)
+        elif args.arc:
             _print_arc_overrides(conn)
         elif args.list:
             _print_envelope_domain_list(conn, args.list)

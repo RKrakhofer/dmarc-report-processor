@@ -159,3 +159,101 @@ Visualisiert die DKIM-Pass-Rate (= Domain-Reputation) als ASCII-Balkendiagramm, 
 # Exchange Online
 0 6 * * * /path/to/dmarc-report-processor/.venv/bin/python /path/to/dmarc-report-processor/dmarc_processor.py --xchg -q
 ```
+
+## Docker
+
+Das Image wird automatisch via GitHub Actions gebaut und im GitHub Container Registry veröffentlicht:
+
+```
+ghcr.io/rkkrakhofer/dmarc-report-processor:latest
+```
+
+[![Build and Push Docker Image](https://github.com/RKrakhofer/dmarc-report-processor/actions/workflows/docker-build-push.yml/badge.svg)](https://github.com/RKrakhofer/dmarc-report-processor/actions/workflows/docker-build-push.yml)
+
+### Image verwenden (ohne lokalen Build)
+
+`docker-compose.yml` anpassen – `build: .` durch das fertige Image ersetzen:
+
+```yaml
+services:
+  imap:
+    image: ghcr.io/rkkrakhofer/dmarc-report-processor:latest
+    # build: .   # auskommentieren wenn das GHCR-Image verwendet wird
+```
+
+Danach:
+
+```bash
+docker compose pull
+docker compose run --rm imap
+```
+
+### Image lokal bauen
+
+```bash
+docker compose build
+```
+
+### Einmaliger Lauf (IMAP oder Exchange Online)
+
+```bash
+docker compose run --rm imap      # IMAP (Credentials aus .env)
+docker compose run --rm xchg      # Exchange Online
+docker compose run --rm imap --rescan   # IMAP mit Full-Rescan
+```
+
+### Report anzeigen
+
+```bash
+docker compose run --rm report                    # Vollständiger Report
+docker compose run --rm report --timeline 30d     # Zeitverlauf
+docker compose run --rm report --list '*'         # Alle Domains
+```
+
+### SQLite-Shell
+
+```bash
+docker compose run --rm db
+```
+
+Öffnet eine interaktive `sqlite3`-Session auf `/data/dmarc_reports.db`.
+Nützliche Queries:
+
+```sql
+-- Überblick
+SELECT org_name, domain, COUNT(*) AS reports FROM reports GROUP BY domain ORDER BY reports DESC;
+
+-- Fehlschläge (DKIM oder SPF fail)
+SELECT r.domain, rr.source_ip, rr.count, rr.dkim_eval, rr.spf_eval
+FROM report_records rr JOIN reports r ON rr.report_db_id = r.id
+WHERE rr.dkim_eval != 'pass' OR rr.spf_eval != 'pass'
+ORDER BY rr.count DESC;
+
+-- Blockierte Mails
+SELECT r.domain, rr.source_ip, rr.count FROM report_records rr
+JOIN reports r ON rr.report_db_id = r.id
+WHERE rr.disposition IN ('reject','quarantine')
+ORDER BY rr.count DESC;
+```
+
+### Datenbank-Persistenz
+
+Die Datenbank wird im Verzeichnis `./data/` auf dem Host gespeichert (Bind-Mount → `/data` im Container). Das Verzeichnis wird beim ersten Start automatisch angelegt.
+
+### Cronjob mit Docker (täglich 6 Uhr)
+
+```cron
+# IMAP
+0 6 * * * cd /path/to/dmarc-report-processor && docker compose run --rm imap
+
+# Exchange Online
+0 6 * * * cd /path/to/dmarc-report-processor && docker compose run --rm xchg
+```
+
+### Dateien (Docker)
+
+| Datei | Beschreibung |
+|---|---|
+| `Dockerfile` | Multi-stage Build, Python 3.12-slim + sqlite3-Binary |
+| `docker-compose.yml` | Services: `imap`, `xchg`, `db`, `report` |
+| `.dockerignore` | Schließt `.venv`, `.env`, `data/`, Cache aus |

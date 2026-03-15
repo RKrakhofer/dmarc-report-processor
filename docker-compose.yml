@@ -1,0 +1,50 @@
+services:
+  # -------------------------------------------------------------------------
+  # IMAP-Modus: docker compose run --rm imap
+  # -------------------------------------------------------------------------
+  imap:
+    build: .
+    image: dmarc-processor
+    env_file: .env
+    command: ["--imap", "-q"]
+    volumes:
+      - ./data:/data
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # Exchange Online-Modus: docker compose run --rm xchg
+  # -------------------------------------------------------------------------
+  xchg:
+    build: .
+    image: dmarc-processor
+    env_file: .env
+    command: ["--xchg", "-q"]
+    volumes:
+      - ./data:/data
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # SQLite-Shell: docker compose run --rm db
+  # Öffnet eine interaktive sqlite3-Session auf der Datenbank.
+  # -------------------------------------------------------------------------
+  db:
+    build: .
+    image: dmarc-processor
+    volumes:
+      - ./data:/data
+    entrypoint: ["sqlite3", "/data/dmarc_reports.db"]
+    stdin_open: true
+    tty: true
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # Report: docker compose run --rm report [--timeline 30d|--list *|...]
+  # -------------------------------------------------------------------------
+  report:
+    build: .
+    image: dmarc-processor
+    env_file: .env
+    entrypoint: ["python", "dmarc_report.py"]
+    volumes:
+      - ./data:/data
+    restart: "no"

@@ -30,18 +30,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='Nur Warnungen und Fehler ausgeben (für Cronjob)')
     parser.add_argument('--rescan', action='store_true',
-                        help='Alle Ordner neu scannen (setzt last_uid zurück)')
+                        help='Alle Ordner neu scannen (setzt Zustand zurück)')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--imap', action='store_true',
+                      help='E-Mails von einem IMAP-Server lesen')
+    mode.add_argument('--xchg', action='store_true',
+                      help='E-Mails von Exchange Online lesen (Microsoft Graph API)')
     return parser.parse_args()
 
 load_dotenv()
 
-IMAP_HOST     = os.environ['IMAP_HOST']
+# IMAP-Konfiguration
+IMAP_HOST     = os.getenv('IMAP_HOST', '')
 IMAP_PORT     = int(os.getenv('IMAP_PORT', '993'))
-IMAP_USER     = os.environ['IMAP_USER']
-IMAP_PASSWORD = os.environ['IMAP_PASSWORD']
+IMAP_USER     = os.getenv('IMAP_USER', '')
+IMAP_PASSWORD = os.getenv('IMAP_PASSWORD', '')
 IMAP_FOLDER   = [f.strip() for f in os.getenv('IMAP_FOLDER', 'INBOX').split(',') if f.strip()]
 TRASH_FOLDER  = os.getenv('TRASH_FOLDER', 'Trash')
 DB_PATH       = Path(os.getenv('DB_PATH', 'dmarc_reports.db'))
+
+# Exchange Online-Konfiguration (Microsoft Graph API)
+XCHG_TENANT_ID     = os.getenv('XCHG_TENANT_ID', '')
+XCHG_CLIENT_ID     = os.getenv('XCHG_CLIENT_ID', '')
+XCHG_CLIENT_SECRET = os.getenv('XCHG_CLIENT_SECRET', '')
+XCHG_USER          = os.getenv('XCHG_USER', '')   # UPN oder E-Mail des Postfachs
+XCHG_FOLDER        = [f.strip() for f in os.getenv('XCHG_FOLDER', 'Inbox').split(',') if f.strip()]
+XCHG_TRASH_FOLDER  = os.getenv('XCHG_TRASH_FOLDER', 'deleteditems')
 
 # Content-Types, die DMARC-Anhänge enthalten können
 DMARC_CONTENT_TYPES = {
@@ -123,10 +137,17 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS folder_state (
             folder      TEXT PRIMARY KEY,
             uidvalidity INTEGER NOT NULL,
-            last_uid    INTEGER NOT NULL DEFAULT 0
+            last_uid    INTEGER NOT NULL DEFAULT 0,
+            delta_link  TEXT
         );
     """)
     conn.commit()
+    # Migration: delta_link für Exchange Online (existierende Datenbanken)
+    try:
+        conn.execute('ALTER TABLE folder_state ADD COLUMN delta_link TEXT')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Spalte existiert bereits
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +541,11 @@ def _process_folder(imap: imaplib.IMAP4_SSL, folder: str, parser: BytesParser, c
 
 
 def process_mailbox(conn: sqlite3.Connection) -> None:
+    missing = [name for name, val in [
+        ('IMAP_HOST', IMAP_HOST), ('IMAP_USER', IMAP_USER), ('IMAP_PASSWORD', IMAP_PASSWORD),
+    ] if not val]
+    if missing:
+        raise RuntimeError(f"Fehlende IMAP-Umgebungsvariablen: {', '.join(missing)}")
     log.info(
         "Verbinde mit %s:%d (Ordner: %s, User: %s)",
         IMAP_HOST, IMAP_PORT, ', '.join(IMAP_FOLDER), IMAP_USER,
@@ -546,6 +572,203 @@ def process_mailbox(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Exchange Online-Verarbeitung (Microsoft Graph API)
+# ---------------------------------------------------------------------------
+
+GRAPH_BASE = 'https://graph.microsoft.com/v1.0'
+
+
+def _xchg_get_token() -> str:
+    """Holt ein OAuth2 Bearer-Token via Client Credentials Flow (App-Only)."""
+    try:
+        import msal
+    except ImportError:
+        raise ImportError("'msal' nicht installiert. Bitte: pip install msal")
+    app = msal.ConfidentialClientApplication(
+        XCHG_CLIENT_ID,
+        authority=f'https://login.microsoftonline.com/{XCHG_TENANT_ID}',
+        client_credential=XCHG_CLIENT_SECRET,
+    )
+    result = app.acquire_token_for_client(scopes=['https://graph.microsoft.com/.default'])
+    if 'access_token' not in result:
+        raise RuntimeError(f"Exchange-Token-Fehler: {result.get('error_description', result)}")
+    return result['access_token']
+
+
+def _xchg_resolve_folder(session, user: str, folder_name: str) -> str:
+    """Löst einen Ordner-Namen in eine Folder-ID auf."""
+    well_known = {
+        'inbox': 'inbox', 'sent': 'sentitems', 'sentitems': 'sentitems',
+        'drafts': 'drafts', 'deleted': 'deleteditems', 'deleteditems': 'deleteditems',
+        'junk': 'junkemail', 'spam': 'junkemail',
+    }
+    key = folder_name.lower().replace(' ', '')
+    if key in well_known:
+        return well_known[key]
+    url = (f"{GRAPH_BASE}/users/{user}/mailFolders"
+           f"?$filter=displayName eq '{folder_name}'&$select=id")
+    resp = session.get(url)
+    resp.raise_for_status()
+    items = resp.json().get('value', [])
+    if not items:
+        raise ValueError(f"Exchange-Ordner nicht gefunden: '{folder_name}'")
+    return items[0]['id']
+
+
+def _load_xchg_delta_link(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute(
+        "SELECT delta_link FROM folder_state WHERE folder = ?", (key,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _save_xchg_delta_link(conn: sqlite3.Connection, key: str, delta_link: str) -> None:
+    conn.execute(
+        "INSERT INTO folder_state (folder, uidvalidity, last_uid, delta_link) VALUES (?, 0, 0, ?)"
+        " ON CONFLICT(folder) DO UPDATE SET delta_link = excluded.delta_link",
+        (key, delta_link),
+    )
+    conn.commit()
+
+
+def _xchg_process_folder(
+    session, folder_name: str, parser: BytesParser, conn: sqlite3.Connection,
+) -> tuple[int, int, int]:
+    """Verarbeitet einen Exchange-Online-Ordner. Gibt (new_count, skip_count, trash_count) zurück."""
+    user      = XCHG_USER
+    folder_id = _xchg_resolve_folder(session, user, folder_name)
+    state_key = f'xchg:{folder_name}'
+    delta_url = _load_xchg_delta_link(conn, state_key)
+
+    if delta_url is None:
+        delta_url = (
+            f'{GRAPH_BASE}/users/{user}/mailFolders/{folder_id}/messages/delta'
+            '?$select=id,internetMessageId,isRead&$top=50'
+        )
+
+    new_count   = 0
+    skip_count  = 0
+    trash_count = 0
+    next_delta  = None
+
+    while delta_url:
+        resp = session.get(delta_url)
+        resp.raise_for_status()
+        data      = resp.json()
+        messages  = data.get('value', [])
+        next_delta = data.get('@odata.deltaLink')
+        delta_url  = data.get('@odata.nextLink')
+
+        log.info("%d Mails abgerufen aus Exchange-Ordner '%s'", len(messages), folder_name)
+
+        for msg_meta in messages:
+            msg_id_graph    = msg_meta['id']
+            internet_msg_id = msg_meta.get('internetMessageId', '').strip()
+            if not internet_msg_id:
+                log.debug("Exchange-Mail ohne internetMessageId – übersprungen")
+                continue
+
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM processed_messages WHERE message_id = ?", (internet_msg_id,))
+            if cur.fetchone():
+                try:
+                    mv = session.post(
+                        f'{GRAPH_BASE}/users/{user}/messages/{msg_id_graph}/move',
+                        json={'destinationId': XCHG_TRASH_FOLDER},
+                    )
+                    mv.raise_for_status()
+                    trash_count += 1
+                    log.info("Bereits bekannte Mail in Papierkorb: %s", internet_msg_id)
+                except Exception as exc:
+                    log.warning("Papierkorb-Move fehlgeschlagen: %s", exc)
+                    skip_count += 1
+                continue
+
+            # Rohe RFC-822-Nachricht laden
+            try:
+                mime_resp = session.get(
+                    f'{GRAPH_BASE}/users/{user}/messages/{msg_id_graph}/$value',
+                )
+                mime_resp.raise_for_status()
+                raw_mail = mime_resp.content
+            except Exception as exc:
+                log.warning("Konnte Exchange-Mail nicht laden (%s): %s", internet_msg_id, exc)
+                continue
+
+            msg = parser.parsebytes(raw_mail)
+            try:
+                conn.execute(
+                    "INSERT INTO processed_messages (message_id) VALUES (?)",
+                    (internet_msg_id,),
+                )
+                record_count = process_message(msg, internet_msg_id, conn)
+
+                if record_count > 0:
+                    conn.commit()
+                    new_count += 1
+                    log.info("Verarbeitet: %s – %d Records", internet_msg_id, record_count)
+                    try:
+                        mv = session.post(
+                            f'{GRAPH_BASE}/users/{user}/messages/{msg_id_graph}/move',
+                            json={'destinationId': XCHG_TRASH_FOLDER},
+                        )
+                        mv.raise_for_status()
+                        trash_count += 1
+                    except Exception as exc:
+                        log.warning("Papierkorb-Move fehlgeschlagen für %s: %s", internet_msg_id, exc)
+                else:
+                    conn.rollback()
+                    log.debug("Keine DMARC-Daten in Exchange-Mail %s", internet_msg_id)
+
+            except sqlite3.Error as exc:
+                conn.rollback()
+                log.error("Datenbankfehler bei %s: %s", internet_msg_id, exc)
+
+    if next_delta:
+        _save_xchg_delta_link(conn, state_key, next_delta)
+
+    return new_count, skip_count, trash_count
+
+
+def process_mailbox_exchange(conn: sqlite3.Connection) -> None:
+    """Liest DMARC-Reports aus einem Exchange Online-Postfach via Microsoft Graph API."""
+    missing = [name for name, val in [
+        ('XCHG_TENANT_ID', XCHG_TENANT_ID), ('XCHG_CLIENT_ID', XCHG_CLIENT_ID),
+        ('XCHG_CLIENT_SECRET', XCHG_CLIENT_SECRET), ('XCHG_USER', XCHG_USER),
+    ] if not val]
+    if missing:
+        raise RuntimeError(f"Fehlende Exchange-Umgebungsvariablen: {', '.join(missing)}")
+
+    log.info("Exchange Online: Tenant=%s, User=%s, Ordner=%s",
+             XCHG_TENANT_ID, XCHG_USER, ', '.join(XCHG_FOLDER))
+    token = _xchg_get_token()
+
+    try:
+        import requests
+    except ImportError:
+        raise ImportError("'requests' nicht installiert. Bitte: pip install requests")
+
+    session = requests.Session()
+    session.headers.update({'Authorization': f'Bearer {token}'})
+
+    parser = BytesParser(policy=email_policy.default)
+    total_new   = 0
+    total_skip  = 0
+    total_trash = 0
+
+    for folder_name in XCHG_FOLDER:
+        new, skip, trash = _xchg_process_folder(session, folder_name, parser, conn)
+        total_new   += new
+        total_skip  += skip
+        total_trash += trash
+
+    log.info(
+        "Fertig (Exchange): %d neue Reports verarbeitet, %d bereits bekannte in Papierkorb, %d Moves fehlgeschlagen.",
+        total_new, total_trash, total_skip,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 
@@ -559,10 +782,13 @@ def main() -> None:
     try:
         init_db(conn)
         if args.rescan:
-            conn.execute("UPDATE folder_state SET last_uid = 0")
+            conn.execute("UPDATE folder_state SET last_uid = 0, delta_link = NULL")
             conn.commit()
-            log.info("Rescan: last_uid für alle Ordner zurückgesetzt.")
-        process_mailbox(conn)
+            log.info("Rescan: Zustand für alle Ordner zurückgesetzt.")
+        if args.imap:
+            process_mailbox(conn)
+        else:
+            process_mailbox_exchange(conn)
     except KeyboardInterrupt:
         log.info("Abgebrochen.")
     except Exception:

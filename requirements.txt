@@ -1,2 +1,4 @@
 python-dotenv>=1.0.0
 defusedxml>=0.7.1
+msal>=1.28.0
+requests>=2.31.0

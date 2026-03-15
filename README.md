@@ -1,23 +1,24 @@
 # DMARC Report Processor
 
-Python-Scripts, die DMARC-Reports aus einem IMAP-Postfach lesen, in einer SQLite-Datenbank speichern und auswerten.
+Python-Scripts, die DMARC-Reports aus einem IMAP- oder Exchange Online-Postfach lesen, in einer SQLite-Datenbank speichern und auswerten.
 
 ## Anforderungen
 
-- Verbinde mit IMAP-Server (Credentials aus `.env` / `.env.example`)
-- IMAP-Ordner konfigurierbar über `IMAP_FOLDER` (kommagetrennte Liste), Default: `INBOX`
-- Finde Mails, die DMARC-Reports enthalten, und ermittle deren `Message-ID`
+- Zwei Mail-Backends wählbar: `--imap` (klassischer IMAP-Server) oder `--xchg` (Exchange Online via Microsoft Graph API)
+- Ordner konfigurierbar, kommagetrennte Liste, Standard `INBOX` / `Inbox`
+- Finde Mails mit DMARC-Reports und ermittle deren `Message-ID` / `internetMessageId`
 - Ist die `Message-ID` noch nicht in der SQLite-DB → extrahiere und parse den DMARC-Report in die DB
 - Alle Felder des Reports speichern (Metadaten, Policy, Records, DKIM- und SPF-Auth-Ergebnisse)
-- Erfolgreich verarbeitete Mails → in den Papierkorb verschieben (IMAP MOVE, Fallback: COPY + \Deleted + ’\Seen’)
+- Erfolgreich verarbeitete Mails → in den Papierkorb verschieben
 - Bereits bekannte Mails (doppelter Import) → ebenfalls in den Papierkorb verschieben
 - Laufmodus: Cronjob (einmaliger Lauf, kein Daemon)
-- Inkrementelles Scanning via IMAP-UIDs – nur neue Mails werden geprüft (mit UIDVALIDITY-Sicherung)
+- Inkrementelles Scanning: IMAP via UIDs + UIDVALIDITY, Exchange via delta-Link
 
 ## Technische Details
 
 - **Sprache:** Python 3 mit `.venv`
 - **IMAP:** `imaplib` (TLS, Port 993), UID-basiert, PEEK-Fetch (kein automatisches `\Seen`)
+- **Exchange Online:** `msal` (Client Credentials Flow) + `requests` → Microsoft Graph API; delta query für inkrementelles Scanning
 - **XML-Parser:** `defusedxml` (sicher gegen XML-Bomb / Entity-Expansion)
 - **Datenbank:** SQLite3 mit 6 Tabellen
 
@@ -28,19 +29,21 @@ Python-Scripts, die DMARC-Reports aus einem IMAP-Postfach lesen, in einer SQLite
 - `report_records` – Einzelne Einträge (`source_ip`, `count`, `disposition`, DKIM/SPF-Evaluierung, `reason`, `envelope_to`, `envelope_from`, `header_from`)
 - `auth_dkim_results` – DKIM-Auth-Ergebnisse pro Record (beliebig viele)
 - `auth_spf_results` – SPF-Auth-Ergebnisse pro Record (beliebig viele)
-- `folder_state` – Speichert `last_uid` und `UIDVALIDITY` pro Ordner für inkrementelles Scanning
+- `folder_state` – Speichert `last_uid` + `UIDVALIDITY` (IMAP) bzw. `delta_link` (Exchange) pro Ordner
 
 ## Dateien
 
 | Datei | Beschreibung |
 |---|---|
-| `dmarc_processor.py` | IMAP-Processor: liest und importiert DMARC-Reports |
+| `dmarc_processor.py` | Processor: liest DMARC-Reports via IMAP oder Exchange Online |
 | `dmarc_report.py` | Auswertungs-Report mit Bewertung |
-| `.env.example` | Konfigurationsvorlage |
-| `requirements.txt` | Abhängigkeiten (`python-dotenv`, `defusedxml`) |
+| `.env.example` | Konfigurationsvorlage (IMAP + Exchange) |
+| `requirements.txt` | Abhängigkeiten (`python-dotenv`, `defusedxml`, `msal`, `requests`) |
 | `setup.sh` | Erstellt `.venv` und installiert Abhängigkeiten |
 
 ## Konfiguration (`.env`)
+
+### IMAP (`--imap`)
 
 ```ini
 IMAP_HOST=mail.domain.com
@@ -48,17 +51,40 @@ IMAP_PORT=993
 IMAP_USER=dmarc@domain.com
 IMAP_PASSWORD=geheimes-passwort
 
-# Eigene Domain für Spoofing-Erkennung im Report
-MY_DOMAIN=domain.com
-
 # Kommagetrennte Ordnerliste (Standard: INBOX)
-IMAP_FOLDER=INBOX,DMARC
+IMAP_FOLDER=INBOX
 
-# Papierkorb-Ordner für verarbeitete Mails (Standard: Trash)
+# Papierkorb-Ordner (Standard: Trash)
 TRASH_FOLDER=Trash
 
 # Pfad zur SQLite-DB (Standard: dmarc_reports.db)
 DB_PATH=dmarc_reports.db
+
+# Eigene Domain für Spoofing-Erkennung im Report
+MY_DOMAIN=domain.com
+```
+
+### Exchange Online (`--xchg`)
+
+Voraussetzung: Azure AD App Registration mit **App-Only**-Berechtigung `Mail.ReadWrite`.
+
+```ini
+XCHG_TENANT_ID=00000000-0000-0000-0000-000000000000
+XCHG_CLIENT_ID=00000000-0000-0000-0000-000000000000
+XCHG_CLIENT_SECRET=dein-client-secret
+
+# UPN oder E-Mail des Postfachs
+XCHG_USER=dmarc@domain.com
+
+# Kommagetrennte Ordnerliste (Standard: Inbox)
+# Well-known: Inbox, Sent, Drafts, Deleted, Junk
+XCHG_FOLDER=Inbox
+
+# Papierkorb-Ordner (Standard: deleteditems)
+XCHG_TRASH_FOLDER=deleteditems
+
+DB_PATH=dmarc_reports.db
+MY_DOMAIN=domain.com
 ```
 
 ## Quickstart
@@ -68,16 +94,27 @@ cp .env.example .env
 # .env anpassen
 bash setup.sh
 source .venv/bin/activate
-python dmarc_processor.py   # Mails importieren
-python dmarc_report.py      # Auswertung anzeigen
+
+# IMAP
+python dmarc_processor.py --imap
+
+# Exchange Online
+python dmarc_processor.py --xchg
+
+# Auswertung
+python dmarc_report.py
 ```
 
 ## dmarc_processor.py – Optionen
 
 ```
+--imap         E-Mails von einem IMAP-Server lesen
+--xchg         E-Mails von Exchange Online lesen (Microsoft Graph API)
 -q, --quiet    Nur Warnungen/Fehler ausgeben (für Cronjob)
---rescan       Alle Ordner neu scannen (setzt last_uid zurück, Duplikate werden via Message-ID verhindert)
+--rescan       Alle Ordner neu scannen (setzt Zustand zurück; Duplikate werden via Message-ID verhindert)
 ```
+
+`--imap` und `--xchg` schließen sich gegenseitig aus; eine der beiden Optionen ist Pflicht.
 
 ## dmarc_report.py – Optionen
 
@@ -116,6 +153,9 @@ Visualisiert die DKIM-Pass-Rate (= Domain-Reputation) als ASCII-Balkendiagramm, 
 ## Cronjob (täglich 6 Uhr)
 
 ```cron
-0 6 * * * /path/to/dmarc-report-processor/.venv/bin/python /path/to/dmarc-report-processor/dmarc_processor.py -q
-```
+# IMAP
+0 6 * * * /path/to/dmarc-report-processor/.venv/bin/python /path/to/dmarc-report-processor/dmarc_processor.py --imap -q
 
+# Exchange Online
+0 6 * * * /path/to/dmarc-report-processor/.venv/bin/python /path/to/dmarc-report-processor/dmarc_processor.py --xchg -q
+```

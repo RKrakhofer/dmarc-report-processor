@@ -60,8 +60,8 @@ TRASH_FOLDER=Trash
 # Pfad zur SQLite-DB (Standard: dmarc_reports.db)
 DB_PATH=dmarc_reports.db
 
-# Eigene Domain für Spoofing-Erkennung im Report
-MY_DOMAIN=domain.com
+# Eigene Domains für Spoofing-Erkennung im Report, kommagetrennt
+MY_DOMAINS=domain.com,domain2.com
 ```
 
 ### Exchange Online (`--xchg`)
@@ -84,7 +84,7 @@ XCHG_FOLDER=Inbox
 XCHG_TRASH_FOLDER=deleteditems
 
 DB_PATH=dmarc_reports.db
-MY_DOMAIN=domain.com
+MY_DOMAINS=domain.com,domain2.com
 ```
 
 ## Quickstart
@@ -254,6 +254,6 @@ Die Datenbank wird im Verzeichnis `./data/` auf dem Host gespeichert (Bind-Mount
 
 | Datei | Beschreibung |
 |---|---|
-| `Dockerfile` | Multi-stage Build, Python 3.12-slim + sqlite3-Binary |
+| `Dockerfile` | Python 3.12-slim + sqlite3-Binary, läuft als root (CLI-Tool, kein Netzwerkdienst) |
 | `docker-compose.yml` | Services: `imap`, `xchg`, `db`, `report` |
 | `.dockerignore` | Schließt `.venv`, `.env`, `data/`, Cache aus |

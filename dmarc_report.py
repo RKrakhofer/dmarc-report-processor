@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 DB_PATH   = Path(os.getenv('DB_PATH', 'dmarc_reports.db'))
-MY_DOMAIN = os.getenv('MY_DOMAIN', '')
+MY_DOMAINS = [d.strip() for d in os.getenv('MY_DOMAINS', '').split(',') if d.strip()]
 
 SEP  = '-' * 80
 SEP2 = '=' * 80
@@ -64,8 +64,8 @@ def _print_assessment(conn: sqlite3.Connection) -> None:
     spoof_ips = spoof['ips'] or 0
     if spoof_n > 0:
         findings.append(('⚠', f"Spoofing-Versuche: {spoof_n} Mails von {spoof_ips} fremden IPs mit DKIM✗ + SPF✗"))
-        # DNS-Check: Subdomains von MY_DOMAIN die tatsächlich existieren
-        if MY_DOMAIN:
+        # DNS-Check: Subdomains von MY_DOMAINS die tatsächlich existieren
+        if MY_DOMAINS:
             spoof_domains = conn.execute("""
                 SELECT DISTINCT rr.header_from
                 FROM report_records rr
@@ -75,13 +75,14 @@ def _print_assessment(conn: sqlite3.Connection) -> None:
             """).fetchall()
             for srow in spoof_domains:
                 hf = (srow['header_from'] or '').lower().strip()
-                # Nur echte Subdomains (nicht die eigene Domain selbst)
-                if hf.endswith('.' + MY_DOMAIN.lower()) and hf != MY_DOMAIN.lower():
-                    exists = _dns_exists(hf)
-                    if exists:
-                        findings.append(('🚨', f"ECHTES PROBLEM: Subdomain '{hf}' existiert im DNS und versendet Spoofing-Mails!"))
-                    else:
-                        findings.append(('ℹ', f"Spoofing-Subdomain '{hf}' existiert nicht im DNS – wahrscheinlich nur Label-Fälschung"))
+                for _domain in MY_DOMAINS:
+                    # Nur echte Subdomains (nicht die eigene Domain selbst)
+                    if hf.endswith('.' + _domain.lower()) and hf != _domain.lower():
+                        exists = _dns_exists(hf)
+                        if exists:
+                            findings.append(('🚨', f"ECHTES PROBLEM: Subdomain '{hf}' existiert im DNS und versendet Spoofing-Mails!"))
+                        else:
+                            findings.append(('ℹ', f"Spoofing-Subdomain '{hf}' existiert nicht im DNS – wahrscheinlich nur Label-Fälschung"))
     else:
         findings.append(('✓', "Keine Spoofing-Versuche erkannt"))
 
@@ -281,15 +282,16 @@ def run(conn: sqlite3.Connection) -> None:
     # ------------------------------------------------------------------
     # 5. Auth-Fehler mit eigener Domain im From
     # ------------------------------------------------------------------
-    domain_filter = MY_DOMAIN or None
+    domain_filter = MY_DOMAINS or None
     section(
         f"EIGENE DOMAIN IM FROM – SPF oder DKIM fail"
-        + (f" (filter: {domain_filter})" if domain_filter else " (MY_DOMAIN nicht gesetzt → alle Domains)")
+        + (f" (filter: {', '.join(domain_filter)})" if domain_filter else " (MY_DOMAINS nicht gesetzt → alle Domains)")
     )
     query_param: list = []
     if domain_filter:
-        domain_clause = "AND (rr.header_from LIKE ? OR rr.envelope_from LIKE ?)"
-        query_param   = [f'%{domain_filter}', f'%{domain_filter}']
+        _clauses = ' OR '.join(["(rr.header_from LIKE ? OR rr.envelope_from LIKE ?)"] * len(domain_filter))
+        domain_clause = f"AND ({_clauses})"
+        query_param   = [val for d in domain_filter for val in (f'%{d}', f'%{d}')]
     else:
         domain_clause = ""
 
@@ -507,7 +509,7 @@ def _print_timeline(conn: sqlite3.Connection, count: int, unit: str) -> None:
     BAR_WIDTH = 30
 
     cutoff = int(time.time()) - count * UNIT_SECS[unit]
-    domain_label = f' – {MY_DOMAIN}' if MY_DOMAIN else ''
+    domain_label = f' – {', '.join(MY_DOMAINS)}' if MY_DOMAINS else ''
     section(f"REPUTATION-TIMELINE{domain_label} – letzte {count} {UNIT_NAME[unit]}")
     print(f"  Score = DKIM-Pass-Rate  |  ░ = 0 %   █ = 100 %  |  ⚠ Spoofing  ✗ Blockiert\n")
 

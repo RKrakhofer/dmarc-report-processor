@@ -22,3 +22,4 @@ __pycache__/
 # Workspace-interne Dateien
 copilot-instructions.md
 description.txt
+dmarc_processor.log

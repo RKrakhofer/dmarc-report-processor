@@ -24,6 +24,21 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+LOG_FILE = Path(os.getenv('LOG_FILE', '')) if os.getenv('LOG_FILE') else Path(__file__).parent / 'dmarc_processor.log'
+
+
+def _setup_file_logging() -> None:
+    """File-Handler hinzufügen – loggt immer auf INFO, unabhängig von -q."""
+    # Logfile auf 5000 Zeilen kürzen
+    if LOG_FILE.exists():
+        lines = LOG_FILE.read_text(encoding='utf-8').splitlines()
+        if len(lines) > 5000:
+            LOG_FILE.write_text('\n'.join(lines[-5000:]) + '\n', encoding='utf-8')
+    handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logging.getLogger().addHandler(handler)
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='DMARC Report Processor')
@@ -774,8 +789,12 @@ def process_mailbox_exchange(conn: sqlite3.Connection) -> None:
 
 def main() -> None:
     args = _parse_args()
+    _setup_file_logging()
     if args.quiet:
-        logging.getLogger().setLevel(logging.WARNING)
+        # Nur Console-Handler auf WARNING setzen, File-Handler bleibt auf INFO
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and not hasattr(h, 'baseFilename'):
+                h.setLevel(logging.WARNING)
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")

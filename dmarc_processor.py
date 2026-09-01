@@ -18,6 +18,9 @@ from dotenv import load_dotenv
 from email import policy as email_policy
 from email.parser import BytesParser
 
+import socket
+
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
@@ -29,12 +32,9 @@ LOG_FILE = Path(os.getenv('LOG_FILE', '')) if os.getenv('LOG_FILE') else Path(__
 
 def _setup_file_logging() -> None:
     """File-Handler hinzufügen – loggt immer auf INFO, unabhängig von -q."""
-    # Logfile auf 5000 Zeilen kürzen
-    if LOG_FILE.exists():
-        lines = LOG_FILE.read_text(encoding='utf-8').splitlines()
-        if len(lines) > 5000:
-            LOG_FILE.write_text('\n'.join(lines[-5000:]) + '\n', encoding='utf-8')
-    handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=1 * 1024 * 1024, backupCount=5, encoding='utf-8',
+    )
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logging.getLogger().addHandler(handler)
@@ -567,7 +567,7 @@ def process_mailbox(conn: sqlite3.Connection) -> None:
     )
     parser = BytesParser(policy=email_policy.default)
 
-    with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
+    with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=60) as imap:
         imap.login(IMAP_USER, IMAP_PASSWORD)
 
         total_new   = 0
@@ -622,7 +622,7 @@ def _xchg_resolve_folder(session, user: str, folder_name: str) -> str:
         return well_known[key]
     url = (f"{GRAPH_BASE}/users/{user}/mailFolders"
            f"?$filter=displayName eq '{folder_name}'&$select=id")
-    resp = session.get(url)
+    resp = session.get(url, timeout=30)
     resp.raise_for_status()
     items = resp.json().get('value', [])
     if not items:
@@ -690,6 +690,7 @@ def _xchg_process_folder(
                     mv = session.post(
                         f'{GRAPH_BASE}/users/{user}/messages/{msg_id_graph}/move',
                         json={'destinationId': XCHG_TRASH_FOLDER},
+                        timeout=30,
                     )
                     mv.raise_for_status()
                     trash_count += 1
@@ -703,6 +704,7 @@ def _xchg_process_folder(
             try:
                 mime_resp = session.get(
                     f'{GRAPH_BASE}/users/{user}/messages/{msg_id_graph}/$value',
+                    timeout=30,
                 )
                 mime_resp.raise_for_status()
                 raw_mail = mime_resp.content
@@ -726,6 +728,7 @@ def _xchg_process_folder(
                         mv = session.post(
                             f'{GRAPH_BASE}/users/{user}/messages/{msg_id_graph}/move',
                             json={'destinationId': XCHG_TRASH_FOLDER},
+                            timeout=30,
                         )
                         mv.raise_for_status()
                         trash_count += 1

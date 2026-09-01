@@ -41,13 +41,18 @@ def section(title: str) -> None:
 
 def _dns_exists(hostname: str) -> bool:
     """Prüft ob ein Hostname im DNS auflösbar ist (A, AAAA oder MX genügt)."""
-    for qtype in (socket.AF_INET, socket.AF_INET6):
-        try:
-            socket.getaddrinfo(hostname, None, qtype)
-            return True
-        except socket.gaierror:
-            pass
-    return False
+    orig_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(5)
+    try:
+        for qtype in (socket.AF_INET, socket.AF_INET6):
+            try:
+                socket.getaddrinfo(hostname, None, qtype)
+                return True
+            except socket.gaierror:
+                pass
+        return False
+    finally:
+        socket.setdefaulttimeout(orig_timeout)
 
 
 def _print_assessment(conn: sqlite3.Connection) -> None:

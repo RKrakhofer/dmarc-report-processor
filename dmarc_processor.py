@@ -6,6 +6,7 @@ import gzip
 import imaplib
 import io
 import logging
+import logging.handlers
 import os
 import sqlite3
 import zipfile

@@ -62,6 +62,10 @@ DB_PATH=dmarc_reports.db
 
 # Eigene Domains für Spoofing-Erkennung im Report, kommagetrennt
 MY_DOMAINS=domain.com,domain2.com
+
+# Eigene Sendernetze (CIDR oder Einzel-IP, kommagetrennt, optional).
+# Ohne Angabe werden eigene IPs aus DKIM-passierten Mails der MY_DOMAINS abgeleitet.
+MY_IP_RANGES=192.0.2.0/24,198.51.100.7
 ```
 
 ### Exchange Online (`--xchg`)
@@ -85,6 +89,7 @@ XCHG_TRASH_FOLDER=deleteditems
 
 DB_PATH=dmarc_reports.db
 MY_DOMAINS=domain.com,domain2.com
+MY_IP_RANGES=192.0.2.0/24,198.51.100.7
 ```
 
 ## Quickstart
@@ -133,7 +138,7 @@ Ohne Option: vollständiger Report mit 7 Sektionen:
 4. Verdächtig (DKIM + SPF beide fail)
 5. Eigene Domain im From mit Auth-Fehler
 6. Zeitraum der Reports
-7. Bewertung (inkl. DNS-Check auf Spoofing-Subdomains)
+7. Bewertung (DNS-Check gegen öffentliche Resolver, `disposition=none` von Fremd-IPs als „zugestellt", Erkennung von SPF-Alignment-Bypasses)
 
 ### Timeline-Ausgabe
 

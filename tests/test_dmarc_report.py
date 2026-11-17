@@ -1,6 +1,7 @@
 """Unit tests for dmarc_report.py helper functions."""
 
 import argparse
+import ipaddress
 import sqlite3
 
 import pytest
@@ -39,24 +40,113 @@ def test_timeline_type_invalid(bad):
         dr._timeline_type(bad)
 
 
-# ── _dns_exists ──────────────────────────────────────────────────────
+# ── _dns_exists (öffentlicher Resolver, kein Split-Horizon) ────────────
 
-def test_dns_exists_true(monkeypatch):
-    def fake_getaddrinfo(*a, **kw):
-        return [("1.2.3.4",)]
+def test_dns_exists_uses_public_resolver(monkeypatch):
+    import dns.resolver as dns_resolver
 
-    monkeypatch.setattr(dr.socket, "getaddrinfo", fake_getaddrinfo)
-    assert dr._dns_exists("example.com") is True
+    instances = []
+
+    class FakeResolver:
+        def __init__(self, configure=True):
+            self.configure = configure
+            self.nameservers = []
+            self.lifetime = None
+            self.calls = []
+            instances.append(self)
+
+        def resolve(self, hostname, rdtype, **kwargs):
+            self.calls.append((hostname, rdtype, kwargs.get('lifetime')))
+            return ['answer']
+
+    monkeypatch.setattr(dns_resolver, 'Resolver', FakeResolver)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('socket.getaddrinfo darf nicht verwendet werden')
+
+    monkeypatch.setattr(dr.socket, 'getaddrinfo', forbidden)
+
+    assert dr._dns_exists('Example.COM') is True
+    assert len(instances) == 1
+    resolver = instances[0]
+    assert resolver.configure is False
+    assert resolver.nameservers == list(dr.PUBLIC_DNS_SERVERS)
+    assert resolver.calls == [('example.com', 'A', dr.DNS_TIMEOUT)]
 
 
-def test_dns_exists_false(monkeypatch):
-    import socket as _socket
+def test_dns_exists_nxdomain(monkeypatch):
+    import dns.resolver as dns_resolver
 
-    def fake_getaddrinfo(*a, **kw):
-        raise _socket.gaierror("no address")
+    class FakeResolver:
+        def __init__(self, configure=True):
+            self.nameservers = []
 
-    monkeypatch.setattr(dr.socket, "getaddrinfo", fake_getaddrinfo)
-    assert dr._dns_exists("nonexistent.invalid") is False
+        def resolve(self, hostname, rdtype, **kwargs):
+            raise dns_resolver.NXDOMAIN()
+
+    monkeypatch.setattr(dns_resolver, 'Resolver', FakeResolver)
+    assert dr._dns_exists('nope.invalid') is False
+
+
+def test_dns_exists_invalid_hostname_never_queries(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError('DNS darf für ungültige Hostnamen nicht abgefragt werden')
+
+    monkeypatch.setattr(dr, '_resolve_public', forbidden, raising=False)
+    monkeypatch.setattr(dr.socket, 'getaddrinfo', forbidden)
+    for bad in ('evil; rm -rf /', '-leading.example.com', 'a' * 300, '', None):
+        assert dr._dns_exists(bad) is False
+
+
+# ── Domain-/IP-Marshalling ────────────────────────────────────────────
+
+@pytest.mark.parametrize("host,expected", [
+    ('gov.krakhofer.org', True),
+    ('krakhofer.org', True),
+    ('notkrakhofer.org', False),
+    ('KRakhofer.ORG.', True),
+    (None, False),
+    ('', False),
+])
+def test_in_org_domain(host, expected):
+    assert dr._in_org_domain(host, ['krakhofer.org']) is expected
+
+
+def test_in_org_domain_uses_configured_default(monkeypatch):
+    monkeypatch.setattr(dr, 'MY_DOMAINS', ['krakhofer.org'])
+    assert dr._in_org_domain('x.krakhofer.org') is True
+
+
+def test_parse_ip_ranges_valid():
+    ranges = dr._parse_ip_ranges('192.0.2.0/24, 2001:db8::/32, 198.51.100.7')
+    assert len(ranges) == 3
+    assert ipaddress.ip_address('192.0.2.5') in ranges[0]
+    assert ipaddress.ip_address('2001:db8::1') in ranges[1]
+    assert ipaddress.ip_address('198.51.100.7') in ranges[2]
+
+
+@pytest.mark.parametrize("bad", ['192.0.2.0/33', 'not-an-ip', '10.0.0.0/8, broken'])
+def test_parse_ip_ranges_invalid(bad):
+    with pytest.raises(ValueError):
+        dr._parse_ip_ranges(bad)
+
+
+def test_is_foreign_ip():
+    ranges = dr._parse_ip_ranges('192.0.2.0/24')
+    own = {'198.51.100.7'}
+    assert dr._is_foreign_ip('198.51.100.7', own, ranges) is False
+    assert dr._is_foreign_ip('192.0.2.9', own, ranges) is False
+    assert dr._is_foreign_ip('203.0.113.9', own, ranges) is True
+    assert dr._is_foreign_ip('nonsense', own, ranges) is True
+    assert dr._is_foreign_ip(None, own, ranges) is True
+    assert dr._is_foreign_ip('', own, ranges) is True
+
+
+def test_collect_own_ips(bypass_db):
+    bypass_db.row_factory = sqlite3.Row
+    ips = dr._collect_own_ips(bypass_db)
+    assert '192.99.58.238' in ips
+    assert '159.253.44.48' not in ips
 
 
 # ── fmt_row / section ────────────────────────────────────────────────
@@ -111,6 +201,83 @@ def test_print_assessment(populated_db, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "Spoofing-Versuche" in out
     assert "reject" in out  # policy
+
+
+def test_assessment_detects_alignment_bypass_and_delivered(bypass_db, capsys, monkeypatch):
+    bypass_db.row_factory = sqlite3.Row
+    dr.MY_DOMAINS = ['krakhofer.org']
+    monkeypatch.setattr(dr, '_dns_exists', lambda h: False)
+    dr._print_assessment(bypass_db)
+    out = capsys.readouterr().out
+    assert 'SPF-Alignment-Bypass' in out
+    assert '2475' in out
+    assert '159.253.44.48' in out
+    assert 'disposition=none' in out
+    assert 'zugestellt' in out
+    # externer Newsletter darf nicht als unsere Domain gemeldet werden
+    assert 'external.example' not in out
+
+
+def test_assessment_no_false_bypass_without_foreign_delivery(populated_db, capsys, monkeypatch):
+    populated_db.row_factory = sqlite3.Row
+    dr.MY_DOMAINS = ['krakhofer.org']
+    monkeypatch.setattr(dr, '_dns_exists', lambda h: False)
+    dr._print_assessment(populated_db)
+    out = capsys.readouterr().out
+    assert 'SPF-Alignment-Bypass' not in out
+    assert 'disposition=none' not in out
+
+
+def test_assessment_reports_existing_spoof_subdomain(populated_db, capsys, monkeypatch):
+    populated_db.row_factory = sqlite3.Row
+    dr.MY_DOMAINS = ['krakhofer.org']
+    monkeypatch.setattr(dr, '_dns_exists', lambda h: True)
+    dr._print_assessment(populated_db)
+    out = capsys.readouterr().out
+    assert 'ECHTES PROBLEM' in out
+    assert 'xpvfyeztqo.krakhofer.org' in out
+
+
+def test_assessment_respects_my_ip_ranges(bypass_db, capsys, monkeypatch):
+    bypass_db.row_factory = sqlite3.Row
+    dr.MY_DOMAINS = ['krakhofer.org']
+
+    monkeypatch.setattr(dr, 'MY_IP_RANGES', ())
+    dr._print_assessment(bypass_db)
+    out = capsys.readouterr().out
+    assert 'SPF-Alignment-Bypass' in out
+
+    monkeypatch.setattr(dr, 'MY_IP_RANGES', (ipaddress.ip_network('159.253.44.48/32'),))
+    dr._print_assessment(bypass_db)
+    out = capsys.readouterr().out
+    assert 'SPF-Alignment-Bypass' not in out
+    assert 'zugestellt' not in out
+
+
+def test_assessment_reports_delivered_without_bypass(conn, capsys):
+    import time
+
+    conn.row_factory = sqlite3.Row
+    dr.MY_DOMAINS = ['krakhofer.org']
+    now = int(time.time())
+    mid = '<delivered@example.com>'
+    conn.execute("INSERT INTO processed_messages (message_id) VALUES (?)", (mid,))
+    conn.execute("""
+        INSERT INTO reports (message_id, org_name, report_id, date_begin, date_end,
+                             domain, policy_p)
+        VALUES (?, 'Google', 'DEL1', ?, ?, 'krakhofer.org', 'reject')
+    """, (mid, now - 60, now))
+    report_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("""
+        INSERT INTO report_records (report_db_id, source_ip, count, disposition,
+                                    dkim_eval, spf_eval, header_from)
+        VALUES (?, '203.0.113.99', 4, 'none', 'pass', 'fail', 'info@krakhofer.org')
+    """, (report_id,))
+    conn.commit()
+    dr._print_assessment(conn)
+    out = capsys.readouterr().out
+    assert 'zugestellt (disposition=none)' in out
+    assert 'SPF-Alignment-Bypass' not in out
 
 
 # ── _print_timeline ──────────────────────────────────────────────────

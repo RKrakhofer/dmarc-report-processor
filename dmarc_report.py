@@ -2,18 +2,45 @@
 """DMARC Report – Auswertung der gespeicherten DMARC-Daten."""
 
 import argparse
+import ipaddress
 import os
 import re
-import socket
+import socket  # nur noch für Kompatibilität/Tests: DNS läuft über dns.resolver
 import sqlite3
 import time
 from pathlib import Path
 
+import dns.exception
+import dns.resolver
 from dotenv import load_dotenv
 
 load_dotenv()
 DB_PATH   = Path(os.getenv('DB_PATH', 'dmarc_reports.db'))
 MY_DOMAINS = [d.strip() for d in os.getenv('MY_DOMAINS', '').split(',') if d.strip()]
+
+
+def _parse_ip_ranges(raw: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Parst kommagetrennte CIDRs/IPs aus MY_IP_RANGES (Marshalling, fail fast)."""
+    ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for token in (raw or '').split(','):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            ranges.append(ipaddress.ip_network(token, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"Ungültiger Wert in MY_IP_RANGES: {token!r}") from exc
+    return tuple(ranges)
+
+
+MY_IP_RANGES = _parse_ip_ranges(os.getenv('MY_IP_RANGES', ''))
+
+PUBLIC_DNS_SERVERS = ('1.1.1.1', '8.8.8.8', '9.9.9.9')
+DNS_TIMEOUT = 5
+_HOSTNAME_RE = re.compile(
+    r'^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$'
+)
 
 SEP  = '-' * 80
 SEP2 = '=' * 80
@@ -39,20 +66,97 @@ def section(title: str) -> None:
     print(f"\n{SEP2}\n  {title}\n{SEP2}")
 
 
-def _dns_exists(hostname: str) -> bool:
-    """Prüft ob ein Hostname im DNS auflösbar ist (A, AAAA oder MX genügt)."""
-    orig_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(5)
-    try:
-        for qtype in (socket.AF_INET, socket.AF_INET6):
-            try:
-                socket.getaddrinfo(hostname, None, qtype)
-                return True
-            except socket.gaierror:
-                pass
+def _normalize_domain(value: object) -> str | None:
+    """Validiert und normalisiert Hostnamen/From-Adressen; None bei ungültiger Eingabe."""
+    if not isinstance(value, str):
+        return None
+    host = value.strip().lower()
+    if '@' in host:
+        host = host.rsplit('@', 1)[1]
+    host = host.rstrip('.')
+    if not host or not _HOSTNAME_RE.fullmatch(host):
+        return None
+    return host
+
+
+def _in_org_domain(host: object, domains: list[str] | None = None) -> bool:
+    """True wenn host selbst oder Subdomain einer der eigenen Domains ist."""
+    if domains is None:
+        domains = MY_DOMAINS
+    normalized = _normalize_domain(host)
+    if not normalized:
         return False
-    finally:
-        socket.setdefaulttimeout(orig_timeout)
+    for domain in domains:
+        own = _normalize_domain(domain)
+        if own and (normalized == own or normalized.endswith('.' + own)):
+            return True
+    return False
+
+
+def _is_foreign_ip(ip: object, own_ips: set[str], ranges=None) -> bool:
+    """True wenn die IP weder bekannte eigene Send-IP noch in MY_IP_RANGES liegt."""
+    if not isinstance(ip, str) or not ip.strip():
+        return True
+    ip_str = ip.strip()
+    if ip_str in own_ips:
+        return False
+    try:
+        address = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    if ranges is None:
+        ranges = MY_IP_RANGES
+    return not any(address in network for network in ranges)
+
+
+def _collect_own_ips(conn: sqlite3.Connection) -> set[str]:
+    """Eigene Send-IPs aus DKIM-passierten Mails unter unseren Domains ableiten."""
+    rows = conn.execute("""
+        SELECT DISTINCT rr.source_ip, d.domain AS dkim_domain
+        FROM report_records rr
+        JOIN auth_dkim_results d ON d.record_id = rr.id
+        WHERE d.result = 'pass' AND rr.source_ip IS NOT NULL
+    """).fetchall()
+    return {
+        str(row['source_ip']).strip()
+        for row in rows
+        if _in_org_domain(row['dkim_domain'], MY_DOMAINS)
+    }
+
+
+def _delivered_foreign_records(conn: sqlite3.Connection, own_ips: set[str], ranges=None) -> list[sqlite3.Row]:
+    """Records mit disposition=none, eigenem From und fremder Quell-IP."""
+    rows = conn.execute("""
+        SELECT rr.source_ip, rr.count, rr.header_from, rr.dkim_eval, rr.spf_eval
+        FROM report_records rr
+        WHERE rr.disposition = 'none'
+          AND rr.header_from IS NOT NULL
+    """).fetchall()
+    return [
+        row for row in rows
+        if _in_org_domain(row['header_from'], MY_DOMAINS)
+        and _is_foreign_ip(row['source_ip'], own_ips, ranges)
+    ]
+
+
+def _resolve_public(hostname: str, rdtype: str) -> bool:
+    """Fragt ausschließlich öffentliche Resolver – nie /etc/resolv.conf (Split-Horizon)."""
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = list(PUBLIC_DNS_SERVERS)
+    resolver.lifetime = DNS_TIMEOUT
+    try:
+        resolver.resolve(hostname, rdtype, lifetime=DNS_TIMEOUT)
+        return True
+    except dns.exception.DNSException:
+        return False
+
+
+def _dns_exists(hostname: str) -> bool:
+    """Prüft öffentlich (A oder AAAA), ob ein Hostname existiert."""
+    host = _normalize_domain(hostname)
+    if not host:
+        return False
+    return _resolve_public(host, 'A') or _resolve_public(host, 'AAAA')
 
 
 def _print_assessment(conn: sqlite3.Connection) -> None:
@@ -90,6 +194,37 @@ def _print_assessment(conn: sqlite3.Connection) -> None:
                             findings.append(('ℹ', f"Spoofing-Subdomain '{hf}' existiert nicht im DNS – wahrscheinlich nur Label-Fälschung"))
     else:
         findings.append(('✓', "Keine Spoofing-Versuche erkannt"))
+
+    # --- Zugestellt: disposition=none von fremden IPs (SPF-Alignment-Bypass) ---
+    own_ips = _collect_own_ips(conn)
+    delivered = _delivered_foreign_records(conn, own_ips)
+    if delivered:
+        delivered_n = sum(row['count'] or 0 for row in delivered)
+        delivered_ips = len({row['source_ip'] for row in delivered})
+        findings.append((
+            '⚠',
+            f"{delivered_n} Mails mit header_from unserer Domain von {delivered_ips} fremden IPs "
+            f"wurden zugestellt (disposition=none)",
+        ))
+
+        bypass = [
+            row for row in delivered
+            if row['spf_eval'] == 'pass' and row['dkim_eval'] != 'pass'
+        ]
+        if bypass:
+            bypass_n = sum(row['count'] or 0 for row in bypass)
+            bypass_ip_set = {row['source_ip'] for row in bypass}
+            bypass_ips = sorted(bypass_ip_set)[:3]
+            bypass_domains = sorted({
+                _normalize_domain(row['header_from']) or '?'
+                for row in bypass
+            })[:3]
+            findings.append((
+                '🚨',
+                f"SPF-Alignment-Bypass: {bypass_n} Mails von {len(bypass_ip_set)} fremden IPs "
+                f"({', '.join(bypass_ips)}) mit DKIM✗ + SPF✓ trotz p=reject zugestellt "
+                f"(u.a. {', '.join(bypass_domains)})",
+            ))
 
     # --- Blockiert ---
     blocked = conn.execute("""

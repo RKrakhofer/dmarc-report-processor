@@ -142,7 +142,8 @@ def test_is_foreign_ip():
     assert dr._is_foreign_ip('', own, ranges) is True
 
 
-def test_collect_own_ips(bypass_db):
+def test_collect_own_ips(bypass_db, monkeypatch):
+    monkeypatch.setattr(dr, 'MY_DOMAINS', ['krakhofer.org'])
     bypass_db.row_factory = sqlite3.Row
     ips = dr._collect_own_ips(bypass_db)
     assert '192.99.58.238' in ips

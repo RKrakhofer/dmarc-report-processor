@@ -22,4 +22,4 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest -v
+        run: python -m pytest -v --cov=dmarc_report --cov=dmarc_processor --cov-branch --cov-report=term-missing
